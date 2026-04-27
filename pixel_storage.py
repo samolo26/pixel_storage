@@ -1,36 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-youtube_pixel_storage_auto_hw.py
+pixel_storage_gpu_max.py
 
-Codificador/descodificador de archivos en vídeo usando bloques de color.
-Inspirado en Brendan-Kirtlan/Video-Encode, pero con selección automática de hardware.
+Codificador/descodificador experimental de archivos dentro de vídeo usando bloques de color.
+No usa QR.
 
 Objetivo:
-- NO usa QR.
-- Perfil único robusto para YouTube:
-    1920x1080, pixelSize=8, repeat=x5, 24 FPS.
-- Al codificar:
-    1) detecta encoders FFmpeg disponibles: NVENC, QSV, AMF, CPU/libx264
-    2) hace una prueba corta de benchmark real
-    3) usa el backend más rápido que funcione
-- Al descodificar:
-    1) detecta decoders/aceleradores: CUDA/NVDEC, QSV, D3D11VA/DXVA2, CPU
-    2) hace una prueba corta de lectura/decodificación
-    3) usa el backend más rápido que funcione
-- Explorador de archivos de Windows.
-- Puede descargar desde YouTube con yt-dlp.
-- Verifica SHA-256 al final.
+- Priorizar GPU y rendimiento.
+- Detectar y probar AMD AMF, NVIDIA NVENC, Intel QSV, Windows h264_mf y CPU fallback.
+- Usar automáticamente la GPU funcional más rápida.
+- Descargar de YouTube a máxima resolución con yt-dlp y descodificar directamente.
+- Verificar SHA-256.
 
 Dependencias:
     pip install opencv-python numpy yt-dlp
 
 Necesario:
     ffmpeg en PATH
-
-Aviso:
-    YouTube recomprime. No existe garantía perfecta.
-    Si el SHA-256 coincide, el archivo recuperado es correcto.
+    deno recomendado para yt-dlp con YouTube
 """
 
 import os
@@ -57,42 +45,55 @@ except Exception:
     filedialog = None
 
 
-# ==========================
-# PERFIL ÚNICO RÁPIDO/YOUTUBE
-# ==========================
+# ============================================================
+# PERFIL RÁPIDO GPU
+# ============================================================
+# Más rápido que el perfil robusto:
+# - BLOCK 4 = más datos por frame
+# - REPEAT 2 = algo de redundancia sin vídeo absurdo
+# Si YouTube rompe el SHA, sube REPEAT a 3/5 o BLOCK a 8.
 WIDTH = 1920
 HEIGHT = 1080
-PIXEL_SIZE = 8
-FPS = 24
-REPEAT = 5
+BLOCK = 4
+FPS = 30
+REPEAT = 2
 
-# CPU fallback
-CRF_CPU = 8
-PRESET_CPU = "slow"
+# Calidad. Menor = más calidad / más peso.
+GPU_QP = 6
+CPU_CRF = 8
+CPU_PRESET = "veryfast"
 
-# GPU quality
-NVENC_QP = 8
-AMF_QP = 8
-QSV_QP = 8
+OUTPUT_SUFFIX = ".gpu_max.mp4"
 
-OUTPUT_SUFFIX = ".ytpixel_youtube_robust.mp4"
+# ============================================================
+# RUTAS DE HERRAMIENTAS
+# ============================================================
+# Cambia esta ruta si tienes ffmpeg.exe en otro sitio.
+# Recomendado:
+#   C:\ffmpeg\bin\ffmpeg.exe
+FFMPEG_PATH = r"C:\ffmpeg\bin\ffmpeg.exe"
 
-BLOCKS_X = WIDTH // PIXEL_SIZE
-BLOCKS_Y = HEIGHT // PIXEL_SIZE
+# Normalmente yt-dlp se instala con pip y queda en PATH.
+# Si tienes yt-dlp.exe en una ruta concreta, puedes ponerla aquí.
+YTDLP_PATH = "yt-dlp"
+
+
+BLOCKS_X = WIDTH // BLOCK
+BLOCKS_Y = HEIGHT // BLOCK
 TOTAL_BLOCKS = BLOCKS_X * BLOCKS_Y
-BYTES_PER_FRAME_RAW = TOTAL_BLOCKS // 4
+PAYLOAD_BYTES_PER_FRAME = TOTAL_BLOCKS // 4  # 4 bloques de 2 bits = 1 byte
 
-META_MAGIC = b"YTPX3"
+META_MAGIC = b"YPGM1"
 META_PREFIX_SIZE = 16
 RESERVED_META_BYTES = 2048
-PAYLOAD_BYTES_PER_FRAME = BYTES_PER_FRAME_RAW
 
-# OpenCV usa BGR.
-BLACK = np.array([0, 0, 0], dtype=np.uint8)
-RED   = np.array([0, 0, 255], dtype=np.uint8)
-GREEN = np.array([0, 255, 0], dtype=np.uint8)
-BLUE  = np.array([255, 0, 0], dtype=np.uint8)
-WHITE = np.array([255, 255, 255], dtype=np.uint8)
+# OpenCV/FFmpeg raw usa BGR.
+BLACK = np.array([0, 0, 0], dtype=np.uint8)        # 00
+RED   = np.array([0, 0, 255], dtype=np.uint8)      # 01
+GREEN = np.array([0, 255, 0], dtype=np.uint8)      # 10
+BLUE  = np.array([255, 0, 0], dtype=np.uint8)      # 11
+WHITE = np.array([255, 255, 255], dtype=np.uint8)  # relleno
+
 PALETTE = np.array([BLACK, RED, GREEN, BLUE], dtype=np.uint8)
 
 try:
@@ -106,7 +107,7 @@ class EncodeBackend:
     key: str
     name: str
     args: list[str]
-    priority: int
+    is_gpu: bool
 
 
 @dataclass
@@ -114,7 +115,7 @@ class DecodeBackend:
     key: str
     name: str
     input_args: list[str]
-    priority: int
+    is_gpu: bool
 
 
 def human_size(n: int) -> str:
@@ -126,168 +127,60 @@ def human_size(n: int) -> str:
         x /= 1024
 
 
-def run_capture(cmd: list[str], timeout: int = 15) -> str:
+def run_capture(cmd: list[str], timeout: int = 30) -> str:
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, errors="ignore", timeout=timeout)
         return (p.stdout or "") + "\n" + (p.stderr or "")
-    except Exception:
-        return ""
+    except Exception as e:
+        return str(e)
 
 
-def ffmpeg_available() -> bool:
-    return shutil.which("ffmpeg") is not None
+def tool_exists(name: str) -> bool:
+    if name == "ffmpeg":
+        return Path(FFMPEG_PATH).is_file() or shutil.which("ffmpeg") is not None
+    if name == "yt-dlp":
+        return Path(YTDLP_PATH).is_file() or shutil.which(YTDLP_PATH) is not None
+    return shutil.which(name) is not None
 
 
-def yt_dlp_available() -> bool:
-    return shutil.which("yt-dlp") is not None
+def ffmpeg_exe() -> str:
+    if Path(FFMPEG_PATH).is_file():
+        return FFMPEG_PATH
+    found = shutil.which("ffmpeg")
+    return found if found else "ffmpeg"
+
+
+def ytdlp_exe() -> str:
+    if Path(YTDLP_PATH).is_file():
+        return YTDLP_PATH
+    found = shutil.which(YTDLP_PATH)
+    return found if found else YTDLP_PATH
 
 
 def ffmpeg_encoders() -> str:
-    if not ffmpeg_available():
+    if not tool_exists("ffmpeg"):
         return ""
-    return run_capture(["ffmpeg", "-hide_banner", "-encoders"], timeout=20).lower()
+    return run_capture([ffmpeg_exe(), "-hide_banner", "-encoders"]).lower()
 
 
 def ffmpeg_hwaccels() -> str:
-    if not ffmpeg_available():
+    if not tool_exists("ffmpeg"):
         return ""
-    return run_capture(["ffmpeg", "-hide_banner", "-hwaccels"], timeout=20).lower()
-
-
-def get_encode_backends() -> list[EncodeBackend]:
-    enc = ffmpeg_encoders()
-    backends: list[EncodeBackend] = []
-
-    # NVIDIA NVENC. Normalmente muy rápido y buena opción si existe.
-    if "h264_nvenc" in enc:
-        backends.append(EncodeBackend(
-            key="nvenc",
-            name="GPU NVIDIA NVENC h264_nvenc",
-            priority=100,
-            args=[
-                "-c:v", "h264_nvenc",
-                "-preset", "p5",
-                "-tune", "hq",
-                "-rc", "constqp",
-                "-qp", str(NVENC_QP),
-                "-pix_fmt", "yuv420p",
-            ],
-        ))
-
-    # Intel Quick Sync. Muy útil si hay iGPU Intel.
-    if "h264_qsv" in enc:
-        backends.append(EncodeBackend(
-            key="qsv",
-            name="GPU Intel QuickSync h264_qsv",
-            priority=90,
-            args=[
-                "-c:v", "h264_qsv",
-                "-preset", "veryfast",
-                "-global_quality", str(QSV_QP),
-                "-pix_fmt", "nv12",
-            ],
-        ))
-
-    # AMD AMF.
-    if "h264_amf" in enc:
-        backends.append(EncodeBackend(
-            key="amf",
-            name="GPU AMD AMF h264_amf",
-            priority=80,
-            args=[
-                "-c:v", "h264_amf",
-                "-quality", "speed",
-                "-usage", "transcoding",
-                "-qp_i", str(AMF_QP),
-                "-qp_p", str(AMF_QP),
-                "-qp_b", str(AMF_QP),
-                "-pix_fmt", "yuv420p",
-            ],
-        ))
-
-    # CPU siempre como fallback.
-    backends.append(EncodeBackend(
-        key="cpu",
-        name="CPU libx264",
-        priority=10,
-        args=[
-            "-c:v", "libx264",
-            "-preset", PRESET_CPU,
-            "-crf", str(CRF_CPU),
-            "-pix_fmt", "yuv420p",
-            "-threads", "0",
-        ],
-    ))
-
-    return backends
-
-
-def get_decode_backends() -> list[DecodeBackend]:
-    hw = ffmpeg_hwaccels()
-    backends: list[DecodeBackend] = []
-
-    # En Windows, d3d11va/dxva2 suelen existir y pueden usar GPU del sistema.
-    # CUDA/NVDEC si NVIDIA está soportada.
-    if "cuda" in hw:
-        backends.append(DecodeBackend(
-            key="cuda",
-            name="GPU NVIDIA CUDA/NVDEC",
-            priority=100,
-            input_args=["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"],
-        ))
-
-    if "qsv" in hw:
-        backends.append(DecodeBackend(
-            key="qsv",
-            name="GPU Intel QuickSync decode",
-            priority=90,
-            input_args=["-hwaccel", "qsv"],
-        ))
-
-    if "d3d11va" in hw:
-        backends.append(DecodeBackend(
-            key="d3d11va",
-            name="GPU Windows D3D11VA",
-            priority=70,
-            input_args=["-hwaccel", "d3d11va"],
-        ))
-
-    if "dxva2" in hw:
-        backends.append(DecodeBackend(
-            key="dxva2",
-            name="GPU Windows DXVA2",
-            priority=60,
-            input_args=["-hwaccel", "dxva2"],
-        ))
-
-    # CPU siempre fallback.
-    backends.append(DecodeBackend(
-        key="cpu",
-        name="CPU FFmpeg decode",
-        priority=10,
-        input_args=[],
-    ))
-
-    return backends
-
-
-# Coordenadas de muestreo.
-YS = np.arange(PIXEL_SIZE // 2, HEIGHT, PIXEL_SIZE)
-XS = np.arange(PIXEL_SIZE // 2, WIDTH, PIXEL_SIZE)
+    return run_capture([ffmpeg_exe(), "-hide_banner", "-hwaccels"]).lower()
 
 
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
         while True:
-            b = f.read(1024 * 1024 * 8)
+            b = f.read(8 * 1024 * 1024)
             if not b:
                 break
             h.update(b)
     return h.hexdigest()
 
 
-def open_file_dialog(title: str, filetypes=None) -> Optional[Path]:
+def choose_open_file(title: str, filetypes=None) -> Optional[Path]:
     if tk is None or filedialog is None:
         raw = input(f"{title} - ruta: ").strip().strip('"')
         return Path(raw).expanduser() if raw else None
@@ -295,19 +188,14 @@ def open_file_dialog(title: str, filetypes=None) -> Optional[Path]:
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
-
     if filetypes is None:
         filetypes = [("Todos los archivos", "*.*")]
-
     filename = filedialog.askopenfilename(title=title, filetypes=filetypes)
     root.destroy()
-
-    if not filename:
-        return None
-    return Path(filename)
+    return Path(filename) if filename else None
 
 
-def save_file_dialog(title: str, default_name: str, default_ext: str = ".mp4") -> Optional[Path]:
+def choose_save_file(title: str, default_name: str, ext: str = ".mp4") -> Optional[Path]:
     if tk is None or filedialog is None:
         raw = input(f"{title} [{default_name}]: ").strip().strip('"')
         return Path(raw).expanduser() if raw else Path(default_name)
@@ -315,21 +203,17 @@ def save_file_dialog(title: str, default_name: str, default_ext: str = ".mp4") -
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
-
     filename = filedialog.asksaveasfilename(
         title=title,
         initialfile=default_name,
-        defaultextension=default_ext,
-        filetypes=[("MP4 video", "*.mp4"), ("Todos los archivos", "*.*")]
+        defaultextension=ext,
+        filetypes=[("MP4", "*.mp4"), ("Todos los archivos", "*.*")]
     )
     root.destroy()
-
-    if not filename:
-        return None
-    return Path(filename)
+    return Path(filename) if filename else None
 
 
-def save_decoded_dialog(default_name: str) -> Optional[Path]:
+def choose_save_decoded(default_name: str) -> Optional[Path]:
     if tk is None or filedialog is None:
         raw = input(f"Guardar archivo recuperado como [{default_name}]: ").strip().strip('"')
         return Path(raw).expanduser() if raw else Path(default_name)
@@ -337,46 +221,165 @@ def save_decoded_dialog(default_name: str) -> Optional[Path]:
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
-
     filename = filedialog.asksaveasfilename(
         title="Guardar archivo recuperado",
         initialfile=default_name,
         filetypes=[("Todos los archivos", "*.*")]
     )
     root.destroy()
+    return Path(filename) if filename else None
 
-    if not filename:
-        return None
-    return Path(filename)
+
+def get_encode_backends() -> list[EncodeBackend]:
+    enc = ffmpeg_encoders()
+    out: list[EncodeBackend] = []
+
+    # AMD AMF - primero porque el usuario usa AMD. El benchmark decide si funciona.
+    if "h264_amf" in enc:
+        out.append(EncodeBackend(
+            "amf_cqp",
+            "GPU AMD AMF h264_amf CQP",
+            [
+                "-c:v", "h264_amf",
+                "-usage", "transcoding",
+                "-quality", "speed",
+                "-rc", "cqp",
+                "-qp_i", str(GPU_QP),
+                "-qp_p", str(GPU_QP),
+                "-pix_fmt", "yuv420p",
+            ],
+            True,
+        ))
+        out.append(EncodeBackend(
+            "amf_simple",
+            "GPU AMD AMF h264_amf simple",
+            [
+                "-c:v", "h264_amf",
+                "-usage", "transcoding",
+                "-quality", "speed",
+                "-pix_fmt", "yuv420p",
+            ],
+            True,
+        ))
+
+    if "h264_nvenc" in enc:
+        out.append(EncodeBackend(
+            "nvenc_p1",
+            "GPU NVIDIA NVENC h264_nvenc máximo rendimiento",
+            [
+                "-c:v", "h264_nvenc",
+                "-preset", "p1",
+                "-tune", "hq",
+                "-rc", "constqp",
+                "-qp", str(GPU_QP),
+                "-pix_fmt", "yuv420p",
+            ],
+            True,
+        ))
+        out.append(EncodeBackend(
+            "nvenc_p5",
+            "GPU NVIDIA NVENC h264_nvenc calidad/rendimiento",
+            [
+                "-c:v", "h264_nvenc",
+                "-preset", "p5",
+                "-tune", "hq",
+                "-rc", "constqp",
+                "-qp", str(GPU_QP),
+                "-pix_fmt", "yuv420p",
+            ],
+            True,
+        ))
+
+    if "h264_qsv" in enc:
+        out.append(EncodeBackend(
+            "qsv",
+            "GPU Intel QuickSync h264_qsv",
+            [
+                "-c:v", "h264_qsv",
+                "-preset", "veryfast",
+                "-global_quality", str(GPU_QP),
+                "-pix_fmt", "nv12",
+            ],
+            True,
+        ))
+
+    if "h264_mf" in enc:
+        out.append(EncodeBackend(
+            "h264_mf",
+            "Windows Media Foundation h264_mf",
+            ["-c:v", "h264_mf", "-pix_fmt", "yuv420p"],
+            True,
+        ))
+
+    # CPU fallback.
+    if "libx264" in enc:
+        out.append(EncodeBackend(
+            "cpu_x264",
+            "CPU libx264 fallback",
+            [
+                "-c:v", "libx264",
+                "-preset", CPU_PRESET,
+                "-crf", str(CPU_CRF),
+                "-pix_fmt", "yuv420p",
+                "-threads", "0",
+            ],
+            False,
+        ))
+
+    if "mpeg4" in enc:
+        out.append(EncodeBackend(
+            "cpu_mpeg4",
+            "CPU MPEG4 fallback",
+            ["-c:v", "mpeg4", "-q:v", "1", "-pix_fmt", "yuv420p"],
+            False,
+        ))
+
+    return out
+
+
+def get_decode_backends() -> list[DecodeBackend]:
+    hw = ffmpeg_hwaccels()
+    out: list[DecodeBackend] = []
+
+    if "cuda" in hw:
+        out.append(DecodeBackend("cuda", "GPU NVIDIA CUDA/NVDEC", ["-hwaccel", "cuda"], True))
+    if "qsv" in hw:
+        out.append(DecodeBackend("qsv", "GPU Intel QuickSync decode", ["-hwaccel", "qsv"], True))
+    if "d3d11va" in hw:
+        out.append(DecodeBackend("d3d11va", "GPU Windows D3D11VA", ["-hwaccel", "d3d11va"], True))
+    if "dxva2" in hw:
+        out.append(DecodeBackend("dxva2", "GPU Windows DXVA2", ["-hwaccel", "dxva2"], True))
+
+    out.append(DecodeBackend("cpu", "CPU FFmpeg decode", [], False))
+    return out
+
+
+YS = np.arange(BLOCK // 2, HEIGHT, BLOCK)
+XS = np.arange(BLOCK // 2, WIDTH, BLOCK)
 
 
 def make_meta_bytes(input_path: Path) -> bytes:
     size = input_path.stat().st_size
-    file_hash = sha256_file(input_path)
     total_data_frames = math.ceil(size / PAYLOAD_BYTES_PER_FRAME)
-
     meta = {
         "magic": META_MAGIC.decode("ascii"),
         "filename": input_path.name,
         "size": size,
-        "sha256": file_hash,
+        "sha256": sha256_file(input_path),
         "width": WIDTH,
         "height": HEIGHT,
-        "pixel_size": PIXEL_SIZE,
+        "block": BLOCK,
         "fps": FPS,
         "repeat": REPEAT,
         "bytes_per_frame": PAYLOAD_BYTES_PER_FRAME,
         "total_data_frames": total_data_frames,
-        "profile": "youtube_robust_v4",
+        "profile": "gpu_max_v1",
     }
-
     data = json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(data) > RESERVED_META_BYTES - META_PREFIX_SIZE:
         raise ValueError("Metadata demasiado grande.")
-
     prefix = META_MAGIC + len(data).to_bytes(4, "big") + b"\x00" * 7
-    blob = prefix + data
-    return blob.ljust(RESERVED_META_BYTES, b"\x00")
+    return (prefix + data).ljust(RESERVED_META_BYTES, b"\x00")
 
 
 def parse_meta_bytes(raw: bytes) -> Optional[dict]:
@@ -384,20 +387,14 @@ def parse_meta_bytes(raw: bytes) -> Optional[dict]:
         return None
     if raw[:5] != META_MAGIC:
         return None
-
     length = int.from_bytes(raw[5:9], "big")
     if length <= 0 or length > RESERVED_META_BYTES:
         return None
-
-    data = raw[META_PREFIX_SIZE:META_PREFIX_SIZE + length]
     try:
-        meta = json.loads(data.decode("utf-8"))
+        meta = json.loads(raw[META_PREFIX_SIZE:META_PREFIX_SIZE + length].decode("utf-8"))
     except Exception:
         return None
-
-    if meta.get("magic") != META_MAGIC.decode("ascii"):
-        return None
-    return meta
+    return meta if meta.get("magic") == META_MAGIC.decode("ascii") else None
 
 
 def bytes_to_frame(chunk: bytes) -> np.ndarray:
@@ -409,10 +406,10 @@ def bytes_to_frame(chunk: bytes) -> np.ndarray:
     if chunk:
         data = np.frombuffer(chunk, dtype=np.uint8)
         g = np.empty(data.size * 4, dtype=np.uint8)
-        g[0::4] = (data >> 6) & 0b11
-        g[1::4] = (data >> 4) & 0b11
-        g[2::4] = (data >> 2) & 0b11
-        g[3::4] = data & 0b11
+        g[0::4] = (data >> 6) & 3
+        g[1::4] = (data >> 4) & 3
+        g[2::4] = (data >> 2) & 3
+        g[3::4] = data & 3
         groups[:g.size] = g
 
     grid = np.empty((BLOCKS_Y, BLOCKS_X, 3), dtype=np.uint8)
@@ -424,10 +421,10 @@ def bytes_to_frame(chunk: bytes) -> np.ndarray:
     grid[g2 == 2] = GREEN
     grid[g2 == 3] = BLUE
 
-    return np.repeat(np.repeat(grid, PIXEL_SIZE, axis=0), PIXEL_SIZE, axis=1)
+    return np.repeat(np.repeat(grid, BLOCK, axis=0), BLOCK, axis=1)
 
 
-def classify_block_centers_fast(sample: np.ndarray) -> np.ndarray:
+def classify_fast(sample: np.ndarray) -> np.ndarray:
     b = sample[:, :, 0].astype(np.int16)
     g = sample[:, :, 1].astype(np.int16)
     r = sample[:, :, 2].astype(np.int16)
@@ -435,27 +432,21 @@ def classify_block_centers_fast(sample: np.ndarray) -> np.ndarray:
     white = (b > 175) & (g > 175) & (r > 175)
     black = (b < 90) & (g < 90) & (r < 90)
 
-    # Orden interno para mapear:
-    # max B -> código azul = 3
-    # max R -> código rojo = 1
-    # max G -> código verde = 2
     stacked = np.stack([b, r, g], axis=2)
-    dominant = stacked.argmax(axis=2)
+    dom = stacked.argmax(axis=2)
 
     out = np.zeros(b.shape, dtype=np.uint8)
-    out[dominant == 1] = 1
-    out[dominant == 2] = 2
-    out[dominant == 0] = 3
-
+    out[dom == 0] = 3  # azul
+    out[dom == 1] = 1  # rojo
+    out[dom == 2] = 2  # verde
     out[black] = 0
     out[white] = 255
     return out
 
 
-def classify_block_centers_distance(sample: np.ndarray) -> np.ndarray:
+def classify_distance(sample: np.ndarray) -> np.ndarray:
     s = sample.astype(np.int16)
     white = (s[:, :, 0] > 175) & (s[:, :, 1] > 175) & (s[:, :, 2] > 175)
-
     pal = PALETTE.astype(np.int16)
     d = ((s[:, :, None, :] - pal[None, None, :, :]) ** 2).sum(axis=3)
     nearest = d.argmin(axis=2).astype(np.uint8)
@@ -465,14 +456,12 @@ def classify_block_centers_distance(sample: np.ndarray) -> np.ndarray:
 
 def groups_to_bytes(groups: np.ndarray) -> bytes:
     groups = groups.reshape(-1)
-
     white_pos = np.where(groups == 255)[0]
     if white_pos.size:
         groups = groups[:white_pos[0]]
 
     usable = (groups.size // 4) * 4
     groups = groups[:usable]
-
     if groups.size == 0:
         return b""
 
@@ -482,46 +471,29 @@ def groups_to_bytes(groups: np.ndarray) -> bytes:
 
 
 def frame_to_bytes(frame: np.ndarray, method: str = "fast") -> bytes:
-    # frame ya llega 1920x1080 bgr24 desde FFmpeg. Por seguridad:
     if frame.shape[1] != WIDTH or frame.shape[0] != HEIGHT:
         frame = cv2.resize(frame, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
-
     sample = frame[np.ix_(YS, XS)]
-    groups = classify_block_centers_distance(sample) if method == "distance" else classify_block_centers_fast(sample)
+    groups = classify_distance(sample) if method == "distance" else classify_fast(sample)
     return groups_to_bytes(groups)
 
 
 def majority_vote(chunks: list[bytes]) -> bytes:
-    """
-    Votación por mayoría real para frames repetidos.
-
-    Con REPEAT=5:
-    - Si 3 o más copias coinciden, gana esa versión.
-    - Si no hay mayoría clara, gana la versión más repetida.
-    - Si todas difieren, se elige la más larga como último recurso.
-
-    Esto no sustituye a ECC/Reed-Solomon, pero mejora mucho frente a repeat=2.
-    """
     chunks = [c for c in chunks if c]
     if not chunks:
         return b""
-
     from collections import Counter
     counter = Counter(chunks)
     best, count = counter.most_common(1)[0]
-
     if count >= (len(chunks) // 2 + 1):
         return best
-
-    # Sin mayoría estricta: si hay empate, prioriza longitud esperada/mayor.
-    best_count = count
-    tied = [c for c, n in counter.items() if n == best_count]
+    tied = [c for c, n in counter.items() if n == count]
     return max(tied, key=len)
 
 
-def make_encode_cmd(output_path: Path, backend: EncodeBackend) -> list[str]:
+def encode_cmd(output_path: Path, backend: EncodeBackend) -> list[str]:
     return [
-        "ffmpeg",
+        ffmpeg_exe(),
         "-y",
         "-hide_banner",
         "-loglevel", "error",
@@ -537,239 +509,209 @@ def make_encode_cmd(output_path: Path, backend: EncodeBackend) -> list[str]:
     ]
 
 
-def benchmark_encoder_backend(backend: EncodeBackend, test_frame: np.ndarray, frames: int = 90) -> Optional[float]:
-    """
-    Devuelve fps medidos o None si falla.
-    """
-    tmp = Path(tempfile.gettempdir()) / f"ytpixel_bench_{backend.key}_{os.getpid()}.mp4"
-    cmd = make_encode_cmd(tmp, backend)
+def benchmark_encoder(backend: EncodeBackend, frames: int = 60) -> Optional[float]:
+    tmp = Path(tempfile.gettempdir()) / f"pixel_gpu_bench_{backend.key}_{os.getpid()}.mp4"
+    cmd = encode_cmd(tmp, backend)
+    frame = bytes_to_frame(b"\x55" * min(PAYLOAD_BYTES_PER_FRAME, 1024 * 64))
+    raw = frame.tobytes()
 
     try:
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         if proc.stdin is None:
             return None
-
-        raw = test_frame.tobytes()
         start = time.time()
         for _ in range(frames):
             proc.stdin.write(raw)
         proc.stdin.close()
-        ret = proc.wait(timeout=60)
+        stderr = proc.stderr.read().decode(errors="ignore") if proc.stderr else ""
+        ret = proc.wait(timeout=90)
         elapsed = max(time.time() - start, 0.001)
-
         try:
             tmp.unlink(missing_ok=True)
         except Exception:
             pass
-
         if ret != 0:
+            if stderr.strip():
+                print(f"      {backend.key}: {stderr.strip().splitlines()[-1]}")
             return None
         return frames / elapsed
-
-    except Exception:
+    except Exception as e:
         try:
             tmp.unlink(missing_ok=True)
         except Exception:
             pass
+        print(f"      {backend.key}: {e}")
         return None
 
 
-def select_best_encoder() -> EncodeBackend:
+def select_encoder() -> EncodeBackend:
     backends = get_encode_backends()
+    if not backends:
+        raise RuntimeError("No se detectó ningún encoder en FFmpeg.")
 
-    # Si solo hay CPU, no benchmark obligatorio.
-    if len(backends) == 1:
-        return backends[0]
+    print("\nBackends detectados:")
+    for b in backends:
+        print(f"  - {b.name}")
 
-    print("\nProbando backends de codificación disponibles...")
-    test_frame = bytes_to_frame(b"\x55" * min(PAYLOAD_BYTES_PER_FRAME, 1024 * 64))
-
+    print("\nBenchmark de codificación:")
     results = []
     for b in backends:
-        fps = benchmark_encoder_backend(b, test_frame, frames=60)
-        if fps is not None:
-            results.append((fps, b))
-            print(f"  OK  {b.name}: {fps:.1f} fps")
+        fps = benchmark_encoder(b)
+        if fps is None:
+            print(f"  NO  {b.name}")
         else:
-            print(f"  NO  {b.name}: falló")
+            tag = "GPU" if b.is_gpu else "CPU"
+            print(f"  OK  {b.name}: {fps:.1f} fps [{tag}]")
+            results.append((fps, b))
 
     if not results:
-        # Fallback duro.
-        for b in backends:
-            if b.key == "cpu":
-                return b
-        return backends[-1]
+        raise RuntimeError("Todos los encoders fallaron. Revisa FFmpeg/drivers.")
 
-    # Elegimos el más rápido medido.
+    # Prioridad: si hay GPU funcional, usamos la GPU más rápida.
+    gpu_results = [(fps, b) for fps, b in results if b.is_gpu]
+    if gpu_results:
+        gpu_results.sort(key=lambda x: x[0], reverse=True)
+        best = gpu_results[0][1]
+        print(f"\nEncoder elegido: {best.name} (mejor GPU funcional)")
+        return best
+
     results.sort(key=lambda x: x[0], reverse=True)
     best = results[0][1]
-    print(f"Backend de codificación elegido: {best.name}")
+    print(f"\nEncoder elegido: {best.name} (fallback CPU)")
     return best
 
 
-def open_ffmpeg_writer(output_path: Path, backend: EncodeBackend):
-    cmd = make_encode_cmd(output_path, backend)
-    return subprocess.Popen(cmd, stdin=subprocess.PIPE), cmd
-
-
 def encode():
-    if not ffmpeg_available():
-        print("\nERROR: FFmpeg no está en PATH.")
-        print("Instálalo y comprueba con: ffmpeg -version")
+    if not tool_exists("ffmpeg"):
+        print("ERROR: FFmpeg no está en PATH.")
         return
 
-    input_path = open_file_dialog("Selecciona el archivo que quieres codificar")
+    input_path = choose_open_file("Selecciona archivo a codificar")
     if not input_path or not input_path.is_file():
         print("No se seleccionó archivo válido.")
         return
 
-    default_output = input_path.with_suffix(OUTPUT_SUFFIX).name
-    output_path = save_file_dialog("Guardar vídeo codificado como", default_output)
+    output_path = choose_save_file("Guardar vídeo", input_path.with_suffix(OUTPUT_SUFFIX).name)
     if not output_path:
         print("Cancelado.")
         return
 
-    backend = select_best_encoder()
+    try:
+        backend = select_encoder()
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return
 
     size = input_path.stat().st_size
     total_data_frames = math.ceil(size / PAYLOAD_BYTES_PER_FRAME)
-    total_logical_frames = 1 + total_data_frames
-    total_real_frames = total_logical_frames * REPEAT
-    duration = total_real_frames / FPS
+    total_logical = total_data_frames + 1
+    total_real = total_logical * REPEAT
+    duration = total_real / FPS
 
-    print("\nPERFIL ÚNICO YOUTUBE ROBUSTO AUTO-HW")
-    print(f"  Resolución:       {WIDTH}x{HEIGHT}")
-    print(f"  Bloque:           {PIXEL_SIZE}x{PIXEL_SIZE}")
-    print(f"  FPS:              {FPS}")
-    print(f"  Repetición:       x{REPEAT}")
-    print(f"  Capacidad/frame:  {human_size(PAYLOAD_BYTES_PER_FRAME)}")
-    print(f"  Encoder elegido:  {backend.name}")
-    print("\nARCHIVO")
-    print(f"  Entrada:          {input_path}")
-    print(f"  Tamaño:           {human_size(size)}")
-    print(f"  Frames lógicos:   {total_logical_frames}")
-    print(f"  Frames reales:    {total_real_frames}")
-    print(f"  Duración vídeo:   {duration/60:.2f} min")
-    print(f"  Salida:           {output_path}")
-    print("\nAVISO: YouTube puede recomprimir y romper datos. El SHA-256 final manda.")
-
-    ok = input("¿Continuar? [s/N]: ").strip().lower()
-    if ok != "s":
-        print("Cancelado.")
+    print("\nRESUMEN")
+    print(f"  Entrada:         {input_path}")
+    print(f"  Tamaño:          {human_size(size)}")
+    print(f"  Salida:          {output_path}")
+    print(f"  Perfil:          {WIDTH}x{HEIGHT}, block={BLOCK}, fps={FPS}, repeat={REPEAT}")
+    print(f"  Capacidad/frame: {human_size(PAYLOAD_BYTES_PER_FRAME)}")
+    print(f"  Frames datos:    {total_data_frames}")
+    print(f"  Frames reales:   {total_real}")
+    print(f"  Duración vídeo:  {duration/60:.2f} min")
+    print(f"  Encoder:         {backend.name}")
+    print("\nAVISO: máxima velocidad GPU no garantiza integridad tras YouTube.")
+    if input("¿Continuar? [s/N]: ").strip().lower() != "s":
         return
 
-    proc, cmd = open_ffmpeg_writer(output_path, backend)
+    cmd = encode_cmd(output_path, backend)
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     if proc.stdin is None:
         print("No se pudo iniciar FFmpeg.")
+        return
+
+    time.sleep(0.2)
+    if proc.poll() is not None:
+        stderr = proc.stderr.read().decode(errors="ignore") if proc.stderr else ""
+        print("FFmpeg se cerró al iniciar.")
+        print(stderr)
         return
 
     start = time.time()
     written = 0
 
-    try:
-        meta = make_meta_bytes(input_path)
-        meta_frame = bytes_to_frame(meta)
-        meta_raw = meta_frame.tobytes()
+    def write_rep(raw: bytes):
+        nonlocal written
         for _ in range(REPEAT):
-            proc.stdin.write(meta_raw)
+            proc.stdin.write(raw)
             written += 1
 
+    try:
+        write_rep(bytes_to_frame(make_meta_bytes(input_path)).tobytes())
+
         with input_path.open("rb") as f:
-            for idx in range(total_data_frames):
+            for i in range(total_data_frames):
                 chunk = f.read(PAYLOAD_BYTES_PER_FRAME)
-                frame = bytes_to_frame(chunk)
-                raw = frame.tobytes()
+                write_rep(bytes_to_frame(chunk).tobytes())
 
-                for _ in range(REPEAT):
-                    proc.stdin.write(raw)
-                    written += 1
-
-                if (idx + 1) % 100 == 0 or (idx + 1) == total_data_frames:
+                if (i + 1) % 100 == 0 or (i + 1) == total_data_frames:
                     elapsed = max(time.time() - start, 0.001)
-                    fps_real = written / elapsed
-                    pct = (idx + 1) / total_data_frames * 100
-                    eta = (total_real_frames - written) / max(fps_real, 0.001)
-                    print(
-                        f"  Progreso: {idx+1}/{total_data_frames} frames de datos "
-                        f"({pct:.1f}%) | {fps_real:.1f} fps reales | ETA {eta/60:.1f} min",
-                        flush=True,
-                    )
+                    fps = written / elapsed
+                    pct = (i + 1) / total_data_frames * 100
+                    eta = (total_real - written) / max(fps, 0.001)
+                    print(f"  Progreso: {i+1}/{total_data_frames} ({pct:.1f}%) | {fps:.1f} fps | ETA {eta/60:.1f} min", flush=True)
 
-    except BrokenPipeError:
-        print("\nERROR: FFmpeg cerró el pipe. El backend elegido falló.")
+    except (BrokenPipeError, OSError) as e:
+        print(f"ERROR escribiendo a FFmpeg: {e}")
+        stderr = proc.stderr.read().decode(errors="ignore") if proc.stderr else ""
+        if stderr:
+            print(stderr)
+        return
     finally:
         try:
             proc.stdin.close()
         except Exception:
             pass
 
+    stderr = proc.stderr.read().decode(errors="ignore") if proc.stderr else ""
     ret = proc.wait()
     if ret != 0:
-        print(f"\nERROR: FFmpeg terminó con código {ret}.")
+        print(f"FFmpeg terminó con error {ret}")
+        if stderr:
+            print(stderr)
         return
 
     elapsed = max(time.time() - start, 0.001)
-    print("\nCODIFICACIÓN TERMINADA")
-    print(f"  Salida:      {output_path}")
-    print(f"  Tamaño vídeo:{human_size(output_path.stat().st_size)}")
-    print(f"  Tiempo:      {elapsed/60:.2f} min")
-    print(f"  FPS reales:  {written/elapsed:.1f}")
+    print("\nCODIFICACIÓN COMPLETA")
+    print(f"  Archivo: {output_path}")
+    print(f"  Tamaño:  {human_size(output_path.stat().st_size)}")
+    print(f"  Tiempo:  {elapsed/60:.2f} min")
+    print(f"  FPS:     {written/elapsed:.1f}")
 
 
-def download_youtube_video() -> Optional[Path]:
-    """
-    Descarga automáticamente el vídeo de YouTube a la máxima resolución disponible
-    y devuelve la ruta local para descodificarlo directamente.
-
-    Usa:
-      --remote-components ejs:github
-    porque YouTube puede exigir challenge JS.
-
-    Descarga preferida:
-      mejor vídeo disponible, sin audio, hasta resolución máxima.
-    """
-    if not yt_dlp_available():
-        print("\nERROR: yt-dlp no está instalado o no está en PATH.")
-        print("Instala con: pip install -U yt-dlp")
+def download_youtube() -> Optional[Path]:
+    if not tool_exists("yt-dlp"):
+        print("ERROR: yt-dlp no está instalado.")
         return None
 
-    if not ffmpeg_available():
-        print("\nAVISO: FFmpeg no está en PATH. yt-dlp puede no poder fusionar formatos si hiciera falta.")
-
-    url = input("\nPega la URL de YouTube: ").strip()
+    url = input("URL de YouTube: ").strip()
     if not url:
-        print("URL vacía.")
         return None
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="ytpixel_auto_hw_"))
-    output_template = str(tmpdir / "downloaded.%(ext)s")
-
-    # Máxima calidad de vídeo disponible.
-    # Para descodificar nuestros datos NO necesitamos audio.
-    # Orden:
-    # 1) mejor vídeo MP4 disponible
-    # 2) mejor vídeo en cualquier contenedor
-    # 3) mejor formato general si lo anterior falla
+    tmpdir = Path(tempfile.mkdtemp(prefix="pixel_gpu_yt_"))
+    output = str(tmpdir / "downloaded.%(ext)s")
     cmd = [
-        "yt-dlp",
+        ytdlp_exe(),
         "--remote-components", "ejs:github",
         "--force-ipv4",
         "-f", "bv*[ext=mp4]/bv*/bestvideo/best",
         "--merge-output-format", "mp4",
-        "-o", output_template,
+        "-o", output,
         url,
     ]
-
-    print("\nDescargando vídeo con yt-dlp a máxima resolución disponible...")
-    print(f"Carpeta temporal: {tmpdir}")
-    print("Esto puede tardar según el tamaño del vídeo y tu conexión.")
-
+    print("Descargando máxima resolución disponible...")
     try:
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError:
-        print("\nERROR: yt-dlp falló descargando el vídeo.")
-        print("Prueba manualmente:")
-        print(f'yt-dlp --remote-components ejs:github -F "{url}"')
+        print("yt-dlp falló.")
         return None
 
     videos = [p for p in tmpdir.glob("*") if p.suffix.lower() in [".mp4", ".mkv", ".webm"]]
@@ -777,16 +719,14 @@ def download_youtube_video() -> Optional[Path]:
         print("No se encontró vídeo descargado.")
         return None
 
-    # Elegimos el más grande, normalmente será el de mayor calidad/resolución.
-    video = max(videos, key=lambda p: p.stat().st_size)
-    print(f"\nVídeo descargado: {video}")
-    print(f"Tamaño descargado: {human_size(video.stat().st_size)}")
-    print("Descodificando directamente ese archivo...")
-    return video
+    best = max(videos, key=lambda p: p.stat().st_size)
+    print(f"Descargado: {best} ({human_size(best.stat().st_size)})")
+    return best
 
-def make_decode_cmd(video_path: Path, backend: DecodeBackend, max_frames: Optional[int] = None) -> list[str]:
+
+def decode_cmd(video_path: Path, backend: DecodeBackend, max_frames: Optional[int] = None) -> list[str]:
     cmd = [
-        "ffmpeg",
+        ffmpeg_exe(),
         "-hide_banner",
         "-loglevel", "error",
         *backend.input_args,
@@ -802,15 +742,13 @@ def make_decode_cmd(video_path: Path, backend: DecodeBackend, max_frames: Option
     return cmd
 
 
-def benchmark_decode_backend(video_path: Path, backend: DecodeBackend, frames: int = 90) -> Optional[float]:
-    cmd = make_decode_cmd(video_path, backend, max_frames=frames)
+def benchmark_decoder(video_path: Path, backend: DecodeBackend, frames: int = 90) -> Optional[float]:
+    cmd = decode_cmd(video_path, backend, max_frames=frames)
     frame_size = WIDTH * HEIGHT * 3
-
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         if proc.stdout is None:
             return None
-
         start = time.time()
         count = 0
         while count < frames:
@@ -818,55 +756,42 @@ def benchmark_decode_backend(video_path: Path, backend: DecodeBackend, frames: i
             if len(raw) < frame_size:
                 break
             count += 1
-
         try:
             proc.stdout.close()
         except Exception:
             pass
-
         proc.terminate()
         try:
             proc.wait(timeout=5)
         except Exception:
             proc.kill()
-
-        elapsed = max(time.time() - start, 0.001)
         if count < max(5, frames // 4):
             return None
-        return count / elapsed
-
+        return count / max(time.time() - start, 0.001)
     except Exception:
         return None
 
 
-def select_best_decoder(video_path: Path) -> DecodeBackend:
+def select_decoder(video_path: Path) -> DecodeBackend:
     backends = get_decode_backends()
-    print("\nProbando backends de descodificación disponibles...")
-
+    print("\nBenchmark de descodificación:")
     results = []
     for b in backends:
-        fps = benchmark_decode_backend(video_path, b, frames=90)
-        if fps is not None:
-            results.append((fps, b))
-            print(f"  OK  {b.name}: {fps:.1f} fps")
+        fps = benchmark_decoder(video_path, b)
+        if fps is None:
+            print(f"  NO  {b.name}")
         else:
-            print(f"  NO  {b.name}: falló o demasiado lento")
+            print(f"  OK  {b.name}: {fps:.1f} fps")
+            results.append((fps, b))
 
     if not results:
-        for b in backends:
-            if b.key == "cpu":
-                return b
-        return backends[-1]
+        return DecodeBackend("cpu", "CPU FFmpeg decode", [], False)
 
+    # Para decode elegimos el más rápido real, CPU o GPU.
     results.sort(key=lambda x: x[0], reverse=True)
     best = results[0][1]
-    print(f"Backend de descodificación elegido: {best.name}")
+    print(f"Decoder elegido: {best.name}")
     return best
-
-
-def open_ffmpeg_reader(video_path: Path, backend: DecodeBackend):
-    cmd = make_decode_cmd(video_path, backend, max_frames=None)
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL), cmd
 
 
 def read_raw_frame(proc) -> Optional[np.ndarray]:
@@ -879,101 +804,81 @@ def read_raw_frame(proc) -> Optional[np.ndarray]:
     return np.frombuffer(raw, dtype=np.uint8).reshape((HEIGHT, WIDTH, 3))
 
 
-def read_logical_frame(proc, method: str = "fast") -> tuple[bool, bytes, int]:
+def read_logical(proc, method: str = "fast") -> tuple[bool, bytes, int]:
     chunks = []
-    read_count = 0
-
+    n = 0
     for _ in range(REPEAT):
         frame = read_raw_frame(proc)
         if frame is None:
             break
         chunks.append(frame_to_bytes(frame, method=method))
-        read_count += 1
-
-    if read_count == 0:
+        n += 1
+    if n == 0:
         return False, b"", 0
+    return True, majority_vote(chunks), n
 
-    return True, majority_vote(chunks), read_count
 
-
-def decode_from_video_path(video_path: Path):
-    if not ffmpeg_available():
-        print("\nERROR: FFmpeg no está en PATH.")
+def decode_video(video_path: Path):
+    if not tool_exists("ffmpeg"):
+        print("ERROR: FFmpeg no está en PATH.")
         return
 
-    if not video_path or not video_path.is_file():
-        print("Archivo de vídeo no válido.")
-        return
-
-    backend = select_best_decoder(video_path)
-
-    print("\nDESCODIFICANDO")
-    print(f"  Vídeo:        {video_path}")
-    print(f"  Decoder:      {backend.name}")
-    print(f"  Perfil fijo:  {WIDTH}x{HEIGHT}, bloque {PIXEL_SIZE}, repeat x{REPEAT}")
+    backend = select_decoder(video_path)
+    proc = subprocess.Popen(decode_cmd(video_path, backend), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
     start = time.time()
-    physical_frames = 0
+    physical = 0
 
-    proc, cmd = open_ffmpeg_reader(video_path, backend)
-
-    ok, meta_chunk, n = read_logical_frame(proc, method="fast")
-    physical_frames += n
+    ok, meta_chunk, n = read_logical(proc, "fast")
+    physical += n
     meta = parse_meta_bytes(meta_chunk) if ok else None
 
     if not meta:
-        # Reintento usando CPU y método distancia, más tolerante.
         try:
             proc.kill()
         except Exception:
             pass
-
-        cpu_backend = DecodeBackend("cpu", "CPU FFmpeg decode", [], 10)
-        proc, cmd = open_ffmpeg_reader(video_path, cpu_backend)
-        physical_frames = 0
-        ok, meta_chunk, n = read_logical_frame(proc, method="distance")
-        physical_frames += n
+        cpu = DecodeBackend("cpu", "CPU FFmpeg decode", [], False)
+        proc = subprocess.Popen(decode_cmd(video_path, cpu), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        physical = 0
+        ok, meta_chunk, n = read_logical(proc, "distance")
+        physical += n
         meta = parse_meta_bytes(meta_chunk) if ok else None
-        backend = cpu_backend
+        backend = cpu
 
     if not meta:
         try:
             proc.kill()
         except Exception:
             pass
-        print("\nERROR: No se pudo leer metadata.")
-        print("Causas típicas: vídeo recomprimido demasiado, perfil distinto, resolución cambiada o descarga incorrecta.")
+        print("No se pudo leer metadata. Vídeo corrupto o perfil diferente.")
         return
 
-    print("\nMetadata detectada:")
-    print(f"  Nombre original: {meta.get('filename')}")
-    print(f"  Tamaño original: {human_size(int(meta.get('size', 0)))}")
-    print(f"  SHA-256:         {meta.get('sha256')}")
-    print(f"  Frames datos:    {meta.get('total_data_frames')}")
+    print("\nMetadata:")
+    print(f"  Nombre: {meta['filename']}")
+    print(f"  Tamaño: {human_size(int(meta['size']))}")
+    print(f"  SHA:    {meta['sha256']}")
+    print(f"  Chunks: {meta['total_data_frames']}")
+
+    out_path = choose_save_decoded("decoded_" + Path(meta["filename"]).name)
+    if not out_path:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return
 
     expected_size = int(meta["size"])
     expected_chunks = int(meta["total_data_frames"])
     expected_hash = meta["sha256"]
-    original_name = Path(meta["filename"]).name
 
-    default_name = "decoded_" + original_name
-    output_path = save_decoded_dialog(default_name)
-    if not output_path:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        print("Cancelado.")
-        return
-
-    print("\nReconstruyendo archivo...")
     written = 0
-    chunks_done = 0
+    done = 0
 
-    with output_path.open("wb") as out:
-        while chunks_done < expected_chunks:
-            ok, chunk, n = read_logical_frame(proc, method="fast")
-            physical_frames += n
+    with out_path.open("wb") as out:
+        while done < expected_chunks:
+            ok, chunk, n = read_logical(proc, "fast")
+            physical += n
             if not ok:
                 break
 
@@ -982,135 +887,125 @@ def decode_from_video_path(video_path: Path):
 
             out.write(chunk)
             written += len(chunk)
-            chunks_done += 1
+            done += 1
 
-            if chunks_done % 300 == 0 or chunks_done == expected_chunks:
+            if done % 100 == 0 or done == expected_chunks:
                 elapsed = max(time.time() - start, 0.001)
-                fps_real = physical_frames / elapsed
-                pct = chunks_done / expected_chunks * 100
-                eta = ((expected_chunks - chunks_done) * REPEAT) / max(fps_real, 0.001)
-                print(
-                    f"  Progreso: {chunks_done}/{expected_chunks} chunks "
-                    f"({pct:.1f}%) | {fps_real:.1f} fps lectura/proceso | ETA {eta/60:.1f} min",
-                    flush=True,
-                )
+                fps = physical / elapsed
+                pct = done / expected_chunks * 100
+                eta = ((expected_chunks - done) * REPEAT) / max(fps, 0.001)
+                print(f"  Progreso: {done}/{expected_chunks} ({pct:.1f}%) | {fps:.1f} fps | ETA {eta/60:.1f} min", flush=True)
 
             if written >= expected_size:
                 break
 
-    try:
-        proc.stdout.close()
-    except Exception:
-        pass
     try:
         proc.terminate()
     except Exception:
         pass
 
     if written < expected_size:
-        print(f"\nERROR: Archivo incompleto. Escrito {human_size(written)} de {human_size(expected_size)}.")
+        print(f"Archivo incompleto: {human_size(written)} de {human_size(expected_size)}")
         return
 
-    with output_path.open("rb+") as f:
+    with out_path.open("rb+") as f:
         f.truncate(expected_size)
 
-    print(f"\nArchivo escrito: {output_path}")
-    print(f"Tamaño: {human_size(output_path.stat().st_size)}")
+    actual = sha256_file(out_path)
 
-    print("Verificando SHA-256...")
-    actual_hash = sha256_file(output_path)
+    print("\nDESCODIFICACIÓN COMPLETA")
+    print(f"  Archivo:      {out_path}")
+    print(f"  SHA esperado: {expected_hash}")
+    print(f"  SHA obtenido: {actual}")
+    print(f"  Decoder:      {backend.name}")
+    print(f"  Tiempo:       {(time.time()-start)/60:.2f} min")
 
-    print(f"SHA esperado:  {expected_hash}")
-    print(f"SHA obtenido:  {actual_hash}")
-
-    elapsed = max(time.time() - start, 0.001)
-    print(f"Tiempo descodificación: {elapsed/60:.2f} min")
-    print(f"FPS lectura/proceso:    {physical_frames/elapsed:.1f}")
-    print(f"Decoder usado:          {backend.name}")
-
-    if actual_hash == expected_hash:
-        print("\nINTEGRIDAD OK: el archivo se recuperó correctamente.")
+    if actual == expected_hash:
+        print("\nINTEGRIDAD OK")
     else:
-        print("\nINTEGRIDAD FALLIDA: el archivo NO coincide.")
-        print("El vídeo cambió demasiados bloques. Prueba más calidad al subir/descargar o un perfil más robusto.")
+        print("\nINTEGRIDAD FALLIDA")
 
 
 def decode():
-    print("\nDESCODIFICAR")
-    print("1) Pegar enlace de YouTube, descargar máxima resolución y descodificar")
-    print("2) Elegir archivo de vídeo local")
+    print("\n1) Descargar desde YouTube y descodificar")
+    print("2) Elegir vídeo local")
+    op = input("Opción: ").strip()
 
-    opt = input("\nOpción: ").strip()
-
-    if opt == "1":
-        video_path = download_youtube_video()
-        if video_path:
-            decode_from_video_path(video_path)
-    elif opt == "2":
-        video_path = open_file_dialog(
-            "Selecciona el vídeo codificado",
-            filetypes=[
-                ("Vídeos", "*.mp4 *.mkv *.webm *.avi"),
-                ("Todos los archivos", "*.*"),
-            ],
-        )
-        if video_path:
-            decode_from_video_path(video_path)
-        else:
-            print("No se seleccionó vídeo.")
+    if op == "1":
+        video = download_youtube()
+        if video:
+            decode_video(video)
+    elif op == "2":
+        video = choose_open_file("Selecciona vídeo", [("Vídeos", "*.mp4 *.mkv *.webm *.avi"), ("Todos", "*.*")])
+        if video:
+            decode_video(video)
     else:
         print("Opción no válida.")
 
 
-def info():
-    duration_per_mib = ((1024**2) / PAYLOAD_BYTES_PER_FRAME * REPEAT) / FPS
-    duration_per_gib = ((1024**3) / PAYLOAD_BYTES_PER_FRAME * REPEAT) / FPS / 60
+def diagnostics():
+    print("\nDIAGNÓSTICO")
+    print(f"Python:       {sys.version.split()[0]}")
+    print(f"CPU:          {os.cpu_count() or 'desconocido'}")
+    print(f"OpenCV hilos: {cv2.getNumThreads()}")
+    print(f"FFmpeg:       {'sí' if tool_exists('ffmpeg') else 'NO'}")
+    print(f"yt-dlp:       {'sí' if tool_exists('yt-dlp') else 'NO'}")
 
-    print("\nCONFIGURACIÓN FIJA")
-    print(f"  Resolución:        {WIDTH}x{HEIGHT}")
-    print(f"  Bloque:            {PIXEL_SIZE}x{PIXEL_SIZE}")
-    print(f"  FPS:               {FPS}")
-    print(f"  Repetición:        x{REPEAT}")
-    print(f"  Capacidad/frame:   {human_size(PAYLOAD_BYTES_PER_FRAME)}")
-    print(f"  Duración/MiB:      {duration_per_mib:.2f} s")
-    print(f"  Duración/GiB:      {duration_per_gib:.2f} min")
-    print(f"  OpenCV hilos:      {cv2.getNumThreads()}")
+    if tool_exists("ffmpeg"):
+        print("\nwhere/which ffmpeg:")
+        if os.name == "nt":
+            print(run_capture(["where", "ffmpeg"]))
+        else:
+            print(run_capture(["which", "ffmpeg"]))
 
-    if ffmpeg_available():
-        print("\nEncoders disponibles candidatos:")
+        print("\nEncoders detectados:")
         for b in get_encode_backends():
             print(f"  - {b.name}")
 
-        print("\nDecoders/aceleradores candidatos:")
+        print("\nDecoders/aceleradores detectados:")
         for b in get_decode_backends():
             print(f"  - {b.name}")
-    else:
-        print("\nFFmpeg no detectado.")
+
+        print("\nComandos de prueba útiles:")
+        print('ffmpeg -hide_banner -encoders | findstr /i "amf nvenc qsv libx264 mpeg4 h264_mf"')
+        print("ffmpeg -hide_banner -f lavfi -i testsrc2=size=1920x1080:rate=30 -t 5 -c:v h264_amf -usage transcoding -quality speed test_amf.mp4")
+
+
+def info():
+    duration_mib = ((1024**2) / PAYLOAD_BYTES_PER_FRAME * REPEAT) / FPS
+    duration_gib = ((1024**3) / PAYLOAD_BYTES_PER_FRAME * REPEAT) / FPS / 60
+    print("\nCONFIGURACIÓN")
+    print(f"  Resolución:      {WIDTH}x{HEIGHT}")
+    print(f"  Block:           {BLOCK}x{BLOCK}")
+    print(f"  FPS:             {FPS}")
+    print(f"  Repeat:          x{REPEAT}")
+    print(f"  Capacidad/frame: {human_size(PAYLOAD_BYTES_PER_FRAME)}")
+    print(f"  Duración/MiB:    {duration_mib:.2f} s")
+    print(f"  Duración/GiB:    {duration_gib:.2f} min")
+    print("  Modo:            velocidad GPU prioritaria")
 
 
 def main():
-    print("YouTube Pixel Storage Auto-HW")
-    print("-----------------------------")
-    print("Sin QR. Bloques de color. Perfil robusto para YouTube con selección automática de hardware.")
-    print(f"CPU detectadas: {os.cpu_count() or 'desconocido'}")
-    print(f"OpenCV hilos:   {cv2.getNumThreads()}")
-    print(f"FFmpeg:         {'detectado' if ffmpeg_available() else 'NO detectado'}")
-    print(f"yt-dlp:         {'detectado' if yt_dlp_available() else 'NO detectado'}")
+    print("Pixel Storage GPU MAX")
+    print("---------------------")
+    print("No QR. Bloques de color. Prioriza GPU y rendimiento.")
 
     while True:
         print("\n1) Codificar archivo a vídeo")
-        print("2) Descodificar vídeo / enlace de YouTube a máxima resolución")
-        print("3) Ver configuración y hardware detectado")
+        print("2) Descodificar vídeo / YouTube")
+        print("3) Ver configuración")
+        print("4) Diagnóstico")
         print("0) Salir")
 
         op = input("\nOpción: ").strip()
-
         if op == "1":
             encode()
         elif op == "2":
             decode()
         elif op == "3":
             info()
+        elif op == "4":
+            diagnostics()
         elif op == "0":
             break
         else:
